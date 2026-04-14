@@ -16,7 +16,7 @@
         transform: rotate(-2deg); 
         display: block;
     }
-        body { margin: 0; background: #1667b8; color: white; font-family: 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        body { margin: 0; background: #1667b8; color: white; font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
 
         /* ── Lobby ─────────────────────────────────────────────────── */
         #join-screen { position: fixed; inset: 0; background: #1a252f; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; }
@@ -39,7 +39,7 @@
         #join-error { color: #e74c3c; font-size: 13px; margin-top: 8px; min-height: 18px; }
 
         /* ── Game Layout ────────────────────────────────────────────── */
-        .game-container { display: flex; gap: 20px; visibility: hidden; }
+        .game-container { display: flex; gap: 20px; visibility: hidden; position: absolute; left: 50%; transform-origin: top left; }
 
         /* ── Scoreboard ─────────────────────────────────────────────── */
         #scoreboard { width: 220px; background: #2c3e50; padding: 15px; border-radius: 8px; border: 2px solid #34495e; }
@@ -147,6 +147,8 @@
         #game-over-screen.show { display:flex; }
         .podium-entry { padding:15px 30px; margin:6px; border-radius:12px; font-size:20px; font-weight:bold; min-width:280px; display:flex; justify-content:space-between; }
         #play-again-btn { margin-top:25px; padding:15px 40px; background:#27ae60; border:none; color:white; border-radius:12px; font-size:18px; font-weight:bold; cursor:pointer; }
+
+        
     </style>
 </head>
 <body>
@@ -171,7 +173,8 @@
                 <div id="bg-preview" style="background:#e74c3c;"></div>
                 <button class="arrow-btn" onclick="changeColor(1)">▶</button>
             </div>
-            <button class="play-btn" onclick="showMenu()">PLAY</button>
+            <button class="play-btn" id="play-btn" onclick="showMenu()">PLAY</button>
+            <div id="invite-hint" style="display:none;margin-top:10px;color:#f1c40f;font-size:13px;">🔑 You were invited! Pick your name &amp; character, then hit Play to join.</div>
         </div>
 
         <div id="game-menu-ui" style="display:none;">
@@ -336,14 +339,18 @@
 
 
     // ── Custom circle cursor ────────────────────────────────────────────────
+    // cssScale is set by scaleGame(). The cursor SVG is in screen pixels, so we
+    // multiply the canvas-space brush radius by cssScale to match the visual size.
+    let cssScale = 1;
+
     function updateCursor() {
         if (!isDrawer || currentTool === 'fill') {
             canvas.style.cursor = isDrawer ? 'crosshair' : 'default';
             return;
         }
         const rawSize = currentTool === 'eraser' ? currentSize * 2 : parseInt(currentSize);
-        const r = Math.max(4, rawSize / 2);
-        // Add 2px padding on each side so circle edge isn't clipped
+        // cssScale converts canvas-pixel brush radius → screen pixels
+        const r = Math.max(4, (rawSize / 2) * cssScale);
         const pad = 2;
         const dim = Math.ceil(r * 2) + pad * 2;
         const cx = dim / 2, cy = dim / 2;
@@ -356,22 +363,28 @@
             <circle cx='${cx}' cy='${cy}' r='1.5' fill='${stroke}'/>
         </svg>`;
 
-        // Hotspot at exact center of the SVG = center of the brush
         canvas.style.cursor = `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${Math.round(cx)} ${Math.round(cy)}, crosshair`;
     }
 
     // ── Chat input gating ────────────────────────────────────────────────────
     let mySocketId = null;
     let hostSocketId = null; // track who the host is so only they fire restartGame
+    // Store pending invite code from URL so we can use it after customization
+    const pendingInviteCode = (() => {
+        const c = new URLSearchParams(location.search).get('code');
+        return (c && c.length === 4) ? c.toUpperCase() : null;
+    })();
+
+    // Show invite hint if arrived via link
+    if (pendingInviteCode) {
+        const hint = document.getElementById('invite-hint');
+        const btn = document.getElementById('play-btn');
+        if (hint) hint.style.display = 'block';
+        if (btn) btn.textContent = '▶ JOIN GAME';
+    }
+
     socket.on('connect', () => {
         mySocketId = socket.id;
-        // Auto-join from URL: game.com/path?code=XXXX
-        const urlCode = new URLSearchParams(location.search).get('code');
-        if (urlCode && urlCode.length === 4) {
-            document.getElementById('code-input').value = urlCode.toUpperCase();
-            // Pre-fill nickname prompt if needed
-            showJoinFlow();
-        }
     });
 
     socket.on('promotedToHost', () => {
@@ -418,9 +431,18 @@
     function userData() { return { name: document.getElementById('username-input').value, avatar: avatars[charIdx], color: nameColors[colorIdx] }; }
     function changeChar(dir) { charIdx = (charIdx + dir + avatars.length) % avatars.length;const display = document.getElementById('char-display');display.innerHTML = `<img src="${avatars[charIdx]}" style="width: 100px; height: 100px; object-fit: contain;">`;}
     function changeColor(dir) { colorIdx = (colorIdx + dir + nameColors.length) % nameColors.length; document.getElementById('bg-preview').style.background = nameColors[colorIdx]; }
-    function showMenu() { if (!document.getElementById('username-input').value.trim()) return alert("Enter a nickname first!"); show('game-menu-ui'); }
+    function showMenu() {
+        if (!document.getElementById('username-input').value.trim()) return alert("Enter a nickname first!");
+        if (pendingInviteCode) {
+            show('join-flow-ui');
+            document.getElementById('join-error').textContent = '';
+            document.getElementById('code-input').value = pendingInviteCode;
+        } else {
+            show('game-menu-ui');
+        }
+    }
     function showHostFlow() { show('host-flow-ui'); socket.emit('createRoom', userData()); }
-    function showJoinFlow() { show('join-flow-ui'); document.getElementById('join-error').textContent = ''; document.getElementById('code-input').value = ''; setTimeout(() => document.getElementById('code-input').focus(), 50); }
+    function showJoinFlow() { show('join-flow-ui'); document.getElementById('join-error').textContent = ''; document.getElementById('code-input').value = pendingInviteCode || ''; setTimeout(() => document.getElementById('code-input').focus(), 50); }
     function submitJoin() { const code = document.getElementById('code-input').value.trim().toUpperCase(); if (code.length !== 4) { document.getElementById('join-error').textContent = 'Please enter a 4-letter code.'; return; } document.getElementById('join-error').textContent = ''; socket.emit('joinRoom', { ...userData(), code }); }
     function backToCustomization() { show('setup-ui'); }
     function backToMenu() { show('game-menu-ui'); }
@@ -464,7 +486,9 @@
 
     socket.on('gameStarting', () => {
         document.getElementById('join-screen').style.display = 'none';
-        document.getElementById('main-game').style.visibility = 'visible';
+        const mg = document.getElementById('main-game');
+        mg.style.visibility = 'visible';
+        scaleGame();
         clearWithWhite();
     });
 
@@ -496,13 +520,17 @@
     function getPos(e) {
         const r = canvas.getBoundingClientRect();
         const src = e.touches ? e.touches[0] : e;
-        // r.width includes CSS border (4px each side = 8px total). Use canvas.width/height
-        // for the true drawable area to get accurate coords without edge drift.
-        const borderX = (r.width  - canvas.width)  / 2;
-        const borderY = (r.height - canvas.height) / 2;
+        // getBoundingClientRect includes the CSS border in the rect dimensions.
+        // We need the inner (content) size to get the correct scale ratio.
+        const borderW = parseFloat(getComputedStyle(canvas).borderLeftWidth)  || 0;
+        const borderH = parseFloat(getComputedStyle(canvas).borderTopWidth)   || 0;
+        const innerW = r.width  - borderW * 2;
+        const innerH = r.height - borderH * 2;
+        const scaleX = canvas.width  / innerW;
+        const scaleY = canvas.height / innerH;
         return {
-            x: Math.max(0, Math.min(canvas.width  - 1, src.clientX - r.left - borderX)),
-            y: Math.max(0, Math.min(canvas.height - 1, src.clientY - r.top  - borderY))
+            x: Math.max(0, Math.min(canvas.width  - 1, (src.clientX - r.left - borderW) * scaleX)),
+            y: Math.max(0, Math.min(canvas.height - 1, (src.clientY - r.top  - borderH) * scaleY))
         };
     }
 
@@ -896,6 +924,30 @@
     });
 
     document.getElementById('chat-input').onkeypress = (e) => { if (e.key === 'Enter' && e.target.value.trim()) { socket.emit('chatMessage', e.target.value); e.target.value = ''; } };
+
+    // ── Responsive scaling ───────────────────────────────────────────────────
+    // Scales the game layout visually to fit any screen. Canvas stays 700×400
+    // internally so drawBresenham, floodFill, getPos etc. are completely unchanged.
+    function scaleGame() {
+        const el = document.getElementById('main-game');
+        if (!el || el.style.visibility === 'hidden') return;
+        const NATURAL_W = 1340;
+        const NATURAL_H = 660;
+        const scale = Math.min(
+            (window.innerWidth  * 0.97) / NATURAL_W,
+            (window.innerHeight * 0.97) / NATURAL_H,
+            1.8
+        );
+        cssScale = scale;
+        const scaledH = NATURAL_H * scale;
+        const topOffset = Math.max(10, Math.round((window.innerHeight - scaledH) / 2));
+        // left:50% + translateX(-50%) centres the unscaled element, then scale grows from top-left
+        // We compensate the horizontal shift: move left by half the NATURAL width times scale
+        el.style.transform = `translateX(-${(NATURAL_W * scale) / 2}px) scale(${scale})`;
+        el.style.top = `${topOffset}px`;
+        updateCursor();
+    }
+    window.addEventListener('resize', scaleGame);
 
     clearWithWhite();
 </script>
