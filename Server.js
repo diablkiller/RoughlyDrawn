@@ -74,7 +74,7 @@ function createRoom(hostSocketID) {
         hostID: hostSocketID,
         currentWord: "",
         drawerID: null,
-        timeLeft: 60,
+        timeLeft: 120,
         timerInterval: null,
         selectionTimeout: null,
         nextRoundTimeout: null,
@@ -101,11 +101,15 @@ function broadcastScoreboard(code) {
 function endRound(code, systemMessage) {
     const room = rooms[code];
     if (!room) return;
+    if (room.roundEnding) return; // prevent double endRound
+    room.roundEnding = true;
 
     clearInterval(room.timerInterval);
     clearInterval(room.hintInterval);
     clearTimeout(room.selectionTimeout);
     clearTimeout(room.nextRoundTimeout);
+    room.timerInterval = null;
+    room.hintInterval = null;
 
     if (room.correctGuessers.length > 0 && room.drawerID && room.players[room.drawerID]) {
         const bonus = 50 * room.correctGuessers.length;
@@ -140,16 +144,22 @@ function startNewRound(code) {
     if (room.currentRoundNum > room.totalRounds) {
         io.to(code).emit('gameOver', room.players);
         room.gameStarted = false;
-        setTimeout(() => { delete rooms[code]; }, 60000);
+        room.deletionTimeout = setTimeout(() => { delete rooms[code]; }, 60000);
         return;
     }
 
     clearInterval(room.timerInterval);
     clearInterval(room.hintInterval);
     clearTimeout(room.selectionTimeout);
+    room.timerInterval = null;
+    room.hintInterval = null;
 
+    room.roundEnding = false;
+    room.restarting = false; // ✅ always clear here so subsequent rounds aren't blocked
     room.correctGuessers = [];
     room.roundPoints = {};
+    room.currentWord = '';  // ✅ BUG FIX 1: clear old word so it can't be guessed during selection
+    room.drawerID = null;   // ✅ BUG FIX 1: clear drawer so old drawer can't draw during selection
 
     // Pick the next drawer in order, skipping anyone who disconnected
     let nextDrawer = null;
@@ -185,41 +195,57 @@ function confirmWordSelection(code, word) {
     if (!room) return;
 
     room.currentWord = word.toUpperCase();
-    room.timeLeft = 60;
+    room.timeLeft = 120;
 
     io.sockets.sockets.forEach((s) => {
         if (!room.players[s.id]) return;
         const role = (s.id === room.drawerID) ? 'drawer' : 'guesser';
+        // For guessers: each letter becomes '_', spaces between words stay as ' ',
+        // chars are separated by a single space. Multi-word: use '  ' as word separator.
         const display = (role === 'drawer')
             ? room.currentWord
-            : room.currentWord.split('').map(c => c === ' ' ? '  ' : '_').join(' ');
-        s.emit('newRound', { role, word: display, drawerID: room.drawerID });
+            : room.currentWord.split('').map(c => c === ' ' ? '   ' : '_').join(' ');
+        s.emit('newRound', { role, word: display, drawerID: room.drawerID, correctGuessers: [] });
     });
 
-    // ── Hint reveal: expose one random hidden letter every 15s ───────────
+    // ── Hint reveal: scaled so longer words reveal more letters ─────────────
+    // Formula: reveal floor(wordLetters / 4) letters max (min 1), spread evenly over 120s.
+    // e.g. 3-letter word → 1 reveal over 120s (reveal at 60s)
+    //      8-letter word → 2 reveals → every 40s
+    //      12-letter word → 3 reveals → every 30s
     const wordArr = room.currentWord.split('');
     room.revealedIndices = new Set(
         wordArr.reduce((acc, ch, i) => { if (ch === ' ') acc.push(i); return acc; }, [])
     );
 
     function buildHintDisplay() {
-        return wordArr.map((ch, i) =>
-            (ch === ' ' || room.revealedIndices.has(i)) ? ch : '_'
-        ).join(' ');
+        // Each letter: '_' or revealed char. Space chars become '   ' (3 spaces).
+        // Then join with ' ' so letters are spaced, and word gaps become 5 spaces total.
+        return wordArr.map((ch, i) => {
+            if (ch === ' ') return '   ';
+            return room.revealedIndices.has(i) ? ch : '_';
+        }).join(' ');
     }
+
+    const letterCount = wordArr.filter(ch => ch !== ' ').length;
+    // Max reveals = floor(letterCount / 4), minimum 1 — but never more than letterCount - 1
+    const maxReveals = Math.max(1, Math.min(Math.floor(letterCount / 4), letterCount - 1));
+    // Spread reveals evenly over the 120s round; first reveal fires after the first interval
+    const hintIntervalMs = Math.floor((room.timeLeft * 1000) / (maxReveals + 1));
 
     room.hintInterval = setInterval(() => {
         const hidden = wordArr
             .map((ch, i) => ({ ch, i }))
             .filter(({ ch, i }) => ch !== ' ' && !room.revealedIndices.has(i));
         if (hidden.length === 0) return;
+        if (room.revealedIndices.size - wordArr.filter(ch => ch === ' ').length >= maxReveals) return; // cap reached
         const pick = hidden[Math.floor(Math.random() * hidden.length)];
         room.revealedIndices.add(pick.i);
         const display = buildHintDisplay();
         Object.keys(room.players).forEach(pid => {
             if (pid !== room.drawerID) io.to(pid).emit('hintUpdate', display);
         });
-    }, 15000);
+    }, hintIntervalMs);
 
     room.timerInterval = setInterval(() => {
         room.timeLeft--;
@@ -271,6 +297,52 @@ io.on('connection', (socket) => {
         startNewRound(socket.roomCode);
     });
 
+    socket.on('restartGame', () => {
+        const code = socket.roomCode;
+        const room = rooms[code];
+        if (!room) return;
+
+        // Only the host may trigger a restart, and only once
+        if (socket.id !== room.hostID) return;
+        if (room.restarting) return;
+        room.restarting = true;
+
+        // Cancel any pending room-deletion timer from gameOver
+        if (room.deletionTimeout) {
+            clearTimeout(room.deletionTimeout);
+            room.deletionTimeout = null;
+        }
+
+        // Clear all active timers
+        clearInterval(room.timerInterval);
+        clearInterval(room.hintInterval);
+        clearTimeout(room.selectionTimeout);
+        clearTimeout(room.nextRoundTimeout);
+        room.timerInterval = null;
+        room.hintInterval = null;
+        room.selectionTimeout = null;
+        room.nextRoundTimeout = null;
+
+        // Reset all game state
+        Object.keys(room.players).forEach(id => { room.players[id].score = 0; });
+        room.currentRoundNum = 1;
+        room.drawOrderIndex = 0;
+        room.drawOrder = Object.keys(room.players);
+        room.currentWord = '';
+        room.drawerID = null;
+        room.correctGuessers = [];
+        room.roundPoints = {};
+        room.roundEnding = false;
+        room.gameStarted = true;
+
+        // Tell all clients to reset their UI; a short delay lets the UI settle before newRound fires
+        io.to(code).emit('gameRestarting', { players: room.players });
+        setTimeout(() => {
+            room.restarting = false; // clear AFTER the delay so rapid re-fires are blocked
+            startNewRound(code);
+        }, 800);
+    });
+
     // 🎯 UPDATED CHAT HANDLER
     socket.on('chatMessage', (msg) => {
         const code = socket.roomCode;
@@ -291,7 +363,7 @@ io.on('connection', (socket) => {
             room.gameStarted &&
             result.correct
         ) {
-            const points = 100 + Math.floor(room.timeLeft / 0.6);
+            const points = 100 + Math.floor(room.timeLeft / 1.2);
 
             room.players[socket.id].score += points;
             room.roundPoints[socket.id] = (room.roundPoints[socket.id] || 0) + points;
@@ -324,15 +396,17 @@ io.on('connection', (socket) => {
 
     // ── Drawing relay: forward strokes to every OTHER player in the room ──
     socket.on('draw', (data) => {
-        const room = rooms[socket.roomCode];
+        const code = socket.roomCode;
+        const room = rooms[code];
         if (!room || socket.id !== room.drawerID) return;
-        socket.to(socket.roomCode).emit('drawData', data);
+        socket.to(code).emit('drawData', data);
     });
 
     socket.on('fill', (data) => {
-        const room = rooms[socket.roomCode];
+        const code = socket.roomCode;
+        const room = rooms[code];
         if (!room || socket.id !== room.drawerID) return;
-        socket.to(socket.roomCode).emit('fillData', data);
+        socket.to(code).emit('fillData', data);
     });
 
     socket.on('requestClear', () => {
@@ -348,9 +422,69 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        const room = rooms[socket.roomCode];
+        const code = socket.roomCode;
+        const room = rooms[code];
         if (!room) return;
+
+        const wasDrawer = (socket.id === room.drawerID);
+        const wasHost   = (socket.id === room.hostID);
+
         delete room.players[socket.id];
+
+        // If game hasn't started, just refresh the lobby
+        if (!room.gameStarted) {
+            // Reassign host if needed
+            const remaining = Object.keys(room.players);
+            if (remaining.length === 0) { delete rooms[code]; return; }
+            if (wasHost) {
+                room.hostID = remaining[0];
+                io.to(room.hostID).emit('promotedToHost');
+            }
+            io.to(code).emit('updateLobby', { players: room.players, hostID: room.hostID });
+            return;
+        }
+
+        const remaining = Object.keys(room.players);
+        if (remaining.length === 0) {
+            // Empty room — clean up
+            clearInterval(room.timerInterval);
+            clearInterval(room.hintInterval);
+            clearTimeout(room.selectionTimeout);
+            clearTimeout(room.nextRoundTimeout);
+            delete rooms[code];
+            return;
+        }
+
+        if (remaining.length === 1) {
+            // Only one player left — end game
+            clearInterval(room.timerInterval);
+            clearInterval(room.hintInterval);
+            clearTimeout(room.selectionTimeout);
+            clearTimeout(room.nextRoundTimeout);
+            io.to(code).emit('receiveMessage', { user: 'SYSTEM', text: '⚠️ Not enough players. Game over.' });
+            io.to(code).emit('gameOver', room.players);
+            room.gameStarted = false;
+            room.deletionTimeout = setTimeout(() => { delete rooms[code]; }, 60000);
+            return;
+        }
+
+        if (wasDrawer) {
+            // Drawer left mid-round — announce and skip to next round
+            clearInterval(room.timerInterval);
+            clearInterval(room.hintInterval);
+            clearTimeout(room.selectionTimeout);
+            clearTimeout(room.nextRoundTimeout);
+            io.to(code).emit('receiveMessage', { user: 'SYSTEM', text: '⚠️ The drawer disconnected! Skipping round...' });
+            // Give a short pause then move on
+            room.nextRoundTimeout = setTimeout(() => startNewRound(code), 3000);
+        } else {
+            // Non-drawer left — update scoreboard. If they were the last non-guesser, end round.
+            const nonDrawers = remaining.filter(id => id !== room.drawerID);
+            broadcastScoreboard(code);
+            if (room.currentWord && nonDrawers.length > 0 && room.correctGuessers.length >= nonDrawers.length) {
+                endRound(code, `🎉 Everyone got it! The word was: ${room.currentWord}`);
+            }
+        }
     });
 });
 
