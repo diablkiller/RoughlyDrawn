@@ -186,6 +186,8 @@ function startNewRound(code) {
     broadcastScoreboard(code);
     io.to(code).emit('updateRoundDisplay', { current: room.currentRoundNum, total: room.totalRounds });
     io.to(room.drawerID).emit('requestWordChoice', choices);
+    // Tell everyone else who is picking (emit to all, client ignores it if they're the drawer)
+    io.to(code).emit('waitingForWord', { drawerName: room.players[room.drawerID]?.nickname || 'Someone', drawerID: room.drawerID });
 
     room.selectionTimeout = setTimeout(() => confirmWordSelection(code, choices[0]), 15000);
 }
@@ -380,6 +382,9 @@ io.on('connection', (socket) => {
             }
 
             io.to(code).emit('receiveMessage', { user: "SYSTEM", text: message });
+
+            // Privately reveal the full word to the correct guesser
+            io.to(socket.id).emit('wordRevealed', room.currentWord);
 
             const nonDrawers = Object.keys(room.players).filter(id => id !== room.drawerID);
             if (room.correctGuessers.length >= nonDrawers.length) {
